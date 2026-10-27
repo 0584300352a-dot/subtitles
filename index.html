@@ -127,6 +127,11 @@ dialog::backdrop{background:rgba(10,12,30,.6)}
 .mini.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:700}
 .mini.del{color:var(--danger)}
 .dlg .err{margin-top:10px}
+.tabs{display:flex;gap:6px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:4px}
+.tabs button{flex:1;border:0;background:none;border-radius:10px;min-height:44px;font-weight:500}
+.tabs button[aria-selected="true"]{background:var(--ink);color:var(--bg);font-weight:700}
+.proj-title{display:flex;align-items:center;gap:10px;margin-top:12px}
+.proj-title span{flex:1;font-weight:700;font-size:1.1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 [hidden]{display:none!important}
 </style>
 </head>
@@ -138,6 +143,10 @@ dialog::backdrop{background:rgba(10,12,30,.6)}
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
     </button>
   </header>
+  <nav class="tabs" id="tabs">
+    <button data-tab="home" aria-selected="true">סרטון חדש</button>
+    <button data-tab="gallery" aria-selected="false">הגלריה שלי <span id="galCount"></span></button>
+  </nav>
 
   <!-- חיבור ראשוני -->
   <section class="card" id="setupCard" hidden>
@@ -163,16 +172,19 @@ dialog::backdrop{background:rgba(10,12,30,.6)}
       <button class="btn primary" id="pickBtn">בחר סרטון</button>
       <input type="file" id="fileInput" accept="video/*" hidden>
     </div>
-    <div id="galleryWrap" hidden>
-      <div class="gallery-title">הסרטונים שלי</div>
-      <div class="hint" style="margin-top:0">נשמרים בטלפון, כדי שתוכל לחזור אליהם בכל זמן.</div>
-      <div class="gallery" id="gallery"></div>
-    </div>
     <p class="hint" id="installHint" style="text-align:center;margin-top:14px" hidden>כדי לשתף סרטונים מווצאפ, התקן את האפליקציה: בתפריט ⋮ של כרום בחר "התקנת אפליקציה".</p>
+  </section>
+
+  <!-- גלריה -->
+  <section id="galleryView" hidden>
+    <div class="hint" style="margin-top:14px">הסרטונים נשמרים בטלפון, כדי שתוכל לחזור אליהם בכל זמן.</div>
+    <div class="gallery" id="gallery"></div>
+    <div class="empty" id="galEmpty" hidden>עוד אין כאן סרטונים. כל סרטון שתפתח באפליקציה יישמר כאן אוטומטית.</div>
   </section>
 
   <!-- מסך עבודה -->
   <section id="workView" hidden>
+    <div class="proj-title"><span id="projName"></span><button class="mini" id="renameBtn">שנה שם</button></div>
     <div class="stage">
       <canvas id="pv" width="720" height="405"></canvas>
       <div class="player">
@@ -496,8 +508,18 @@ $('seek').oninput = e => { vid.currentTime = parseFloat(e.target.value); };
 /* ---------- טעינת סרטון ---------- */
 function show(view) {
   $('homeView').hidden = view !== 'home';
+  $('galleryView').hidden = view !== 'gallery';
   $('workView').hidden = view !== 'work';
+  document.querySelectorAll('#tabs button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === view));
 }
+document.querySelectorAll('#tabs button').forEach(b => {
+  b.onclick = async () => { vid.pause(); await saveNow(); show(b.dataset.tab); if (b.dataset.tab === 'gallery') renderGallery(); window.scrollTo(0, 0); };
+});
+$('renameBtn').onclick = () => {
+  const n = prompt('שם חדש לסרטון:', S.name || '');
+  if (n === null || !n.trim()) return;
+  S.name = n.trim(); $('projName').textContent = S.name; saveSoon();
+};
 function loadFile(f, proj) {
   if (!f) return;
   if (!proj && !(f.type || '').startsWith('video') && !/\.(mp4|mov|webm|3gp|mkv|m4v)$/i.test(f.name || '')) {
@@ -520,6 +542,7 @@ function loadFile(f, proj) {
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
     DB.put('blobs', { key: id + ':video', blob: f }).then(saveNow).catch(e => console.warn('save video', e));
   }
+  $('projName').textContent = S.name;
   if (S.url) URL.revokeObjectURL(S.url);
   S.url = URL.createObjectURL(f);
   vid.src = S.url;
@@ -541,7 +564,8 @@ async function renderGallery() {
   let items = [];
   try { items = (await DB.all('projects')).sort((a, b) => b.updated - a.updated); } catch (e) {}
   const box = $('gallery'); box.innerHTML = '';
-  $('galleryWrap').hidden = !items.length;
+  $('galEmpty').hidden = !!items.length;
+  $('galCount').textContent = items.length ? '(' + items.length + ')' : '';
   for (const p of items) {
     const d = document.createElement('div'); d.className = 'proj';
     const img = p.thumb ? document.createElement('img') : document.createElement('div');
@@ -564,10 +588,19 @@ async function renderGallery() {
       const sh = document.createElement('button'); sh.className = 'mini primary'; sh.textContent = 'שתף';
       sh.onclick = async () => {
         const b = await DB.get('blobs', p.id + ':out').catch(() => null);
-        if (b) shareFile(new File([b.blob], b.name || (p.name + '.mp4'), { type: b.blob.type || 'video/mp4' }));
+        if (b) shareFile(new File([b.blob], (p.name || 'video') + '-כתוביות.' + ((b.blob.type || '').includes('webm') ? 'webm' : 'mp4'), { type: b.blob.type || 'video/mp4' }));
       };
       a.append(sh);
     }
+    const rn = document.createElement('button'); rn.className = 'mini'; rn.textContent = 'שנה שם';
+    rn.onclick = async () => {
+      const n = prompt('שם חדש לסרטון:', p.name || '');
+      if (n === null || !n.trim()) return;
+      p.name = n.trim(); p.updated = Date.now();
+      if (S.id === p.id) { S.name = p.name; $('projName').textContent = S.name; }
+      await DB.put('projects', p).catch(() => {}); renderGallery();
+    };
+    a.append(rn);
     const del = document.createElement('button'); del.className = 'mini del'; del.textContent = 'מחק'; del.setAttribute('aria-label', 'מחק את ' + (p.name || 'הסרטון'));
     del.onclick = async () => {
       if (!confirm('למחוק את "' + (p.name || 'הסרטון') + '" מהאפליקציה? הסרטון בגלריה של הטלפון לא יימחק.')) return;
