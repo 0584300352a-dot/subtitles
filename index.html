@@ -260,6 +260,8 @@ dialog::backdrop{background:rgba(10,12,30,.6)}
     <label class="field" for="modelInput" style="margin-top:14px">מודל (בדרך כלל לא צריך לשנות)</label>
     <input type="text" id="modelInput" dir="ltr" placeholder="gemini-flash-latest">
     <div class="hint">בשימוש חינמי גוגל רשאית להשתמש בקול שנשלח לשיפור השירותים שלה.</div>
+    <button class="btn ghost" id="testBtn" style="margin-top:14px">בדוק חיבור ל-Gemini</button>
+    <div class="hint" id="testOut" role="status"></div>
     <div class="row" style="margin-top:16px">
       <button class="btn dark" id="settingsSave">שמור</button>
       <button class="btn ghost" id="settingsClose">סגור</button>
@@ -513,7 +515,7 @@ function show(view) {
   document.querySelectorAll('#tabs button').forEach(b => b.setAttribute('aria-selected', b.dataset.tab === view));
 }
 document.querySelectorAll('#tabs button').forEach(b => {
-  b.onclick = async () => { vid.pause(); await saveNow(); show(b.dataset.tab); if (b.dataset.tab === 'gallery') renderGallery(); window.scrollTo(0, 0); };
+  b.onclick = async () => { vid.pause(); flushVideo(); await saveNow(); show(b.dataset.tab); if (b.dataset.tab === 'gallery') renderGallery(); window.scrollTo(0, 0); };
 });
 $('renameBtn').onclick = () => {
   const n = prompt('שם חדש לסרטון:', S.name || '');
@@ -538,9 +540,8 @@ function loadFile(f, proj) {
   } else {
     Object.assign(S, { id: 'p' + Date.now(), name: (f.name || 'סרטון').replace(/\.[^.]+$/, ''), created: Date.now(),
       segs: [], offset: 0, thumb: '', hasOutput: false });
-    const id = S.id;
+    S.pendingVideo = { id: S.id, f };
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
-    DB.put('blobs', { key: id + ':video', blob: f }).then(saveNow).catch(e => console.warn('save video', e));
   }
   $('projName').textContent = S.name;
   if (S.url) URL.revokeObjectURL(S.url);
@@ -552,12 +553,16 @@ function loadFile(f, proj) {
   if (S.segs.length) openEditor();
   else {
     $('editor').hidden = true; $('newOnly').hidden = false; $('transcribeBox').hidden = false;
-    if (getKey()) startTranscribe();
+    if (getKey()) startTranscribe().finally(flushVideo); else flushVideo();
   }
+}
+function flushVideo() {
+  const pv0 = S.pendingVideo; if (!pv0) return; S.pendingVideo = null;
+  DB.put('blobs', { key: pv0.id + ':video', blob: pv0.f }).then(() => { if (S.id === pv0.id) saveNow(); }).catch(e => console.warn('save video', e));
 }
 $('pickBtn').onclick = () => { if (!getKey()) { $('setupCard').scrollIntoView({ behavior: 'smooth' }); $('setupKey').focus(); return; } $('fileInput').click(); };
 $('fileInput').onchange = e => { loadFile(e.target.files[0]); e.target.value = ''; };
-async function goHome() { vid.pause(); await saveNow(); show('home'); renderGallery(); }
+async function goHome() { vid.pause(); flushVideo(); await saveNow(); show('home'); renderGallery(); }
 $('newBtn').onclick = goHome; $('newBtn2').onclick = goHome;
 
 async function renderGallery() {
@@ -638,6 +643,21 @@ $('setupSave').onclick = () => {
 };
 $('settingsBtn').onclick = () => { $('keyInput').value = getKey(); $('modelInput').value = LS.get('kt_model', ''); $('settingsDlg').showModal(); };
 $('settingsClose').onclick = () => $('settingsDlg').close();
+$('testBtn').onclick = async () => {
+  const out = $('testOut'), key = $('keyInput').value.trim() || getKey();
+  out.textContent = 'בודק…';
+  const t0 = performance.now(), ctrl = new AbortController(), to = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key=${encodeURIComponent(key)}`, { signal: ctrl.signal });
+    const ms = Math.round(performance.now() - t0);
+    if (r.ok) out.textContent = `החיבור תקין, והמפתח עובד (תשובה תוך ${ms} אלפיות שנייה).`;
+    else { let j = null; try { j = await r.json(); } catch (e) {} out.textContent = friendlyError(r.status, j) + ` (קוד ${r.status})`; }
+  } catch (e) {
+    out.textContent = e.name === 'AbortError'
+      ? 'אין תשובה מהשרת של גוגל אחרי 30 שניות. כנראה שמשהו חוסם את החיבור, למשל סינון אינטרנט.'
+      : 'החיבור נכשל (' + e.message + '). אם יש אינטרנט, כנראה שסינון אינטרנט חוסם את השירות.';
+  } finally { clearTimeout(to); }
+};
 $('settingsSave').onclick = () => { LS.set('kt_key', $('keyInput').value.trim()); LS.set('kt_model', $('modelInput').value.trim()); refreshSetup(); $('settingsDlg').close(); };
 
 /* ---------- תמלול ---------- */
@@ -695,37 +715,155 @@ function normalize(arr) {
     .filter(s => s.text && isFinite(s.start))
     .map(s => ({ ...s, end: isFinite(s.end) && s.end > s.start ? s.end : s.start + 2 }));
 }
-async function callGemini(b64) {
+const NETMSG = 'לא הצלחתי להתחבר לשרת של Gemini. אם יש לך אינטרנט, ייתכן שסינון אינטרנט (כמו נטפרי או רימון) חוסם את השירות. אפשר לבדוק בהגדרות: "בדוק חיבור ל-Gemini".';
+async function callGemini(b64, mime) {
   const key = getKey();
-  const body = JSON.stringify({
-    contents: [{ parts: [{ inline_data: { mime_type: 'audio/wav', data: b64 } }, { text: PROMPT }] }],
-    generationConfig: {
-      temperature: 0,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'ARRAY',
-        items: { type: 'OBJECT', properties: { start: { type: 'NUMBER' }, end: { type: 'NUMBER' }, text: { type: 'STRING' } }, required: ['start', 'end', 'text'] }
-      }
+  const base = {
+    temperature: 0,
+    responseMimeType: 'application/json',
+    responseSchema: {
+      type: 'ARRAY',
+      items: { type: 'OBJECT', properties: { start: { type: 'NUMBER' }, end: { type: 'NUMBER' }, text: { type: 'STRING' } }, required: ['start', 'end', 'text'] }
     }
-  });
+  };
+  let noThink = true;
+  const timeoutMs = Math.min(240000, 60000 + b64.length / 1e6 * 15000);
   const models = [...new Set([getModel(), 'gemini-flash-latest', 'gemini-2.5-flash'])];
   for (const m of models) {
     for (let attempt = 0; attempt < 3; attempt++) {
+      const cfg = noThink ? Object.assign({ thinkingConfig: { thinkingBudget: 0 } }, base) : base;
+      const body = JSON.stringify({ contents: [{ parts: [{ inline_data: { mime_type: mime, data: b64 } }, { text: PROMPT }] }], generationConfig: cfg });
+      const ctrl = new AbortController(), to = setTimeout(() => ctrl.abort(), timeoutMs);
       let r;
       try {
         r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(m)}:generateContent?key=${encodeURIComponent(key)}`,
-          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
-      } catch (e) { throw new Error('אין חיבור לאינטרנט, או שהחיבור נקטע. בדוק את החיבור ונסה שוב.'); }
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal: ctrl.signal });
+      } catch (e) {
+        clearTimeout(to);
+        if (e.name === 'AbortError') throw new Error('Gemini לא ענה בזמן. ' + NETMSG);
+        throw new Error(NETMSG);
+      }
+      clearTimeout(to);
       if (r.status === 404) break;
       let j = null; try { j = await r.json(); } catch (e) {}
-      if ((r.status === 429 || r.status >= 500) && attempt < 2) { await sleep(12000 * (attempt + 1)); continue; }
+      const msg = (j && j.error && j.error.message) || '';
+      if (r.status === 400 && noThink && /think/i.test(msg)) { noThink = false; attempt--; continue; }
+      if ((r.status === 429 || r.status >= 500) && attempt < 2) { await sleep(10000 * (attempt + 1)); continue; }
       if (!r.ok) throw new Error(friendlyError(r.status, j));
-      const txt = (((j.candidates || [])[0] || {}).content || {}).parts?.map(p => p.text || '').join('') || '[]';
+      const txt = (((j.candidates || [])[0] || {}).content || {}).parts?.filter(p => !p.thought).map(p => p.text || '').join('') || '[]';
       try { return normalize(JSON.parse(txt.replace(/```json|```/g, '').trim())); }
       catch (e) { throw new Error('התקבלה תשובה לא צפויה מ-Gemini. נסה שוב.'); }
     }
   }
   throw new Error('לא נמצא מודל זמין. פתח את ההגדרות ונקה את שדה "מודל".');
+}
+
+/* ---------- שליפת פס הקול מהקובץ בלי לפענח אותו (MP4/MOV עם AAC) ---------- */
+const b4 = (dv, p) => String.fromCharCode(dv.getUint8(p), dv.getUint8(p + 1), dv.getUint8(p + 2), dv.getUint8(p + 3));
+function boxes(dv, start, end) {
+  const out = []; let p = start;
+  while (p + 8 <= end) {
+    let sz = dv.getUint32(p), hdr = 8; const type = b4(dv, p + 4);
+    if (sz === 1) { sz = Number(dv.getBigUint64(p + 8)); hdr = 16; } else if (sz === 0) sz = end - p;
+    if (sz < 8) break;
+    out.push({ type, start: p + hdr, end: Math.min(end, p + sz) }); p += sz;
+  }
+  return out;
+}
+function boxPath(dv, box, path) {
+  let cur = box;
+  for (const t of path) { cur = boxes(dv, cur.start, cur.end).find(b => b.type === t); if (!cur) return null; }
+  return cur;
+}
+function parseEsds(dv, p, end) {
+  const len = () => { let l = 0; for (let i = 0; i < 4; i++) { const b = dv.getUint8(p++); l = (l << 7) | (b & 0x7f); if (!(b & 0x80)) break; } return l; };
+  while (p < end) {
+    const tag = dv.getUint8(p++), l = len();
+    if (tag === 3) { p += 2; const f = dv.getUint8(p++); if (f & 0x80) p += 2; if (f & 0x40) p += dv.getUint8(p) + 1; if (f & 0x20) p += 2; continue; }
+    if (tag === 4) { p += 13; continue; }
+    if (tag === 5) return [dv.getUint8(p), dv.getUint8(p + 1)];
+    p += l;
+  }
+  throw new Error('no audio config');
+}
+async function fastAudioParts(file) {
+  let pos = 0, moov = null;
+  while (pos + 8 <= file.size) {
+    const h = new DataView(await file.slice(pos, pos + 16).arrayBuffer());
+    let sz = h.getUint32(0); const type = b4(h, 4);
+    if (sz === 1) sz = Number(h.getBigUint64(8)); else if (sz === 0) sz = file.size - pos;
+    if (sz < 8) throw new Error('bad mp4');
+    if (type === 'moov') { moov = new DataView(await file.slice(pos, pos + sz).arrayBuffer()); break; }
+    pos += sz;
+  }
+  if (!moov) throw new Error('no moov');
+  const dv = moov;
+  for (const trak of boxes(dv, 8, dv.byteLength).filter(b => b.type === 'trak')) {
+    const hdlr = boxPath(dv, trak, ['mdia', 'hdlr']);
+    if (!hdlr || b4(dv, hdlr.start + 8) !== 'soun') continue;
+    const mdhd = boxPath(dv, trak, ['mdia', 'mdhd']);
+    const timescale = dv.getUint32(mdhd.start + (dv.getUint8(mdhd.start) === 1 ? 20 : 12));
+    const stbl = boxPath(dv, trak, ['mdia', 'minf', 'stbl']);
+    const kid = t => boxes(dv, stbl.start, stbl.end).find(b => b.type === t);
+    const stsd = kid('stsd'), e0 = stsd.start + 8;
+    if (b4(dv, e0 + 4) !== 'mp4a') throw new Error('audio is not AAC');
+    const ver = dv.getUint16(e0 + 16);
+    const sub = boxes(dv, e0 + 36 + (ver === 1 ? 16 : ver === 2 ? 36 : 0), e0 + dv.getUint32(e0));
+    let esds = sub.find(b => b.type === 'esds');
+    if (!esds) { const w = sub.find(b => b.type === 'wave'); if (w) esds = boxes(dv, w.start, w.end).find(b => b.type === 'esds'); }
+    if (!esds) throw new Error('no esds');
+    const asc = parseEsds(dv, esds.start + 4, esds.end);
+    let obj = asc[0] >> 3; const sr = ((asc[0] & 7) << 1) | (asc[1] >> 7), ch = (asc[1] >> 3) & 15;
+    if (obj === 5 || obj === 29) obj = 2;
+    if (sr > 12 || !ch || obj < 1 || obj > 4) throw new Error('unsupported AAC');
+    const stsz = kid('stsz'), fixed = dv.getUint32(stsz.start + 4), n = dv.getUint32(stsz.start + 8);
+    const size = i => fixed || dv.getUint32(stsz.start + 12 + i * 4);
+    const offs = []; let co = kid('stco');
+    if (co) { for (let i = 0, c = dv.getUint32(co.start + 4); i < c; i++) offs.push(dv.getUint32(co.start + 8 + i * 4)); }
+    else { co = kid('co64'); for (let i = 0, c = dv.getUint32(co.start + 4); i < c; i++) offs.push(Number(dv.getBigUint64(co.start + 8 + i * 8))); }
+    const stsc = kid('stsc'), sc = [];
+    for (let i = 0, c = dv.getUint32(stsc.start + 4); i < c; i++) { const b = stsc.start + 8 + i * 12; sc.push([dv.getUint32(b), dv.getUint32(b + 4)]); }
+    const stts = kid('stts'), times = new Float64Array(n + 1);
+    { let t = 0, si = 0; for (let i = 0, c = dv.getUint32(stts.start + 4); i < c; i++) { const b = stts.start + 8 + i * 8, cnt = dv.getUint32(b), d = dv.getUint32(b + 4); for (let k = 0; k < cnt && si < n; k++) { times[si++] = t / timescale; t += d; } } times[n] = t / timescale; }
+    // קריאת הדגימות לפי "חבילות" רציפות בקובץ
+    const parts = []; let frames = [], bytes = 0, t0 = 0, s = 0, sci = 0;
+    const flush = () => { if (frames.length) parts.push({ blob: new Blob(frames, { type: 'audio/aac' }), mime: 'audio/aac', t0 }); frames = []; bytes = 0; };
+    for (let c = 0; c < offs.length && s < n; c++) {
+      while (sci + 1 < sc.length && sc[sci + 1][0] <= c + 1) sci++;
+      const spc = sc[sci][1];
+      let len = 0; for (let k = 0; k < spc && s + k < n; k++) len += size(s + k);
+      const buf = new Uint8Array(await file.slice(offs[c], offs[c] + len).arrayBuffer());
+      let o = 0;
+      for (let k = 0; k < spc && s < n; k++, s++) {
+        const sz = size(s), fl = sz + 7;
+        if (!frames.length) t0 = times[s];
+        const f = new Uint8Array(fl);
+        f.set([0xFF, 0xF1, ((obj - 1) << 6) | (sr << 2) | ((ch >> 2) & 1), ((ch & 3) << 6) | (fl >> 11), (fl >> 3) & 0xFF, ((fl & 7) << 5) | 0x1F, 0xFC]);
+        f.set(buf.subarray(o, o + sz), 7); o += sz;
+        frames.push(f); bytes += fl;
+        if (bytes > 8e6) flush();
+      }
+    }
+    flush();
+    if (!parts.length) throw new Error('empty audio');
+    return parts;
+  }
+  throw new Error('no audio track');
+}
+async function slowAudioParts(file) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const actx = new AC();
+  let buf;
+  try { buf = await actx.decodeAudioData(await file.arrayBuffer()); }
+  catch (e) { throw new Error('לא הצלחתי לקרוא את הקול מהסרטון. ייתכן שאין בו קול, או שהפורמט לא נתמך.'); }
+  finally { actx.close && actx.close(); }
+  const SR = 16000;
+  const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(buf.duration * SR)), SR);
+  const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start();
+  const mono = (await off.startRendering()).getChannelData(0);
+  const CH = 240 * SR, parts = [];
+  for (let i = 0; i * CH < mono.length; i++) parts.push({ blob: wavBlob(mono.subarray(i * CH, Math.min((i + 1) * CH, mono.length)), SR), mime: 'audio/wav', t0: i * 240 });
+  return parts;
 }
 
 async function startTranscribe() {
@@ -735,26 +873,14 @@ async function startTranscribe() {
   S.busy = true; showErr(''); $('transcribeBtn').disabled = true;
   try {
     status('מוציא את הקול מהסרטון…');
-    const ab = await file.arrayBuffer();
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const actx = new AC();
-    let buf;
-    try { buf = await actx.decodeAudioData(ab); }
-    catch (e) { throw new Error('לא הצלחתי לקרוא את הקול מהסרטון. ייתכן שאין בו קול, או שהפורמט לא נתמך.'); }
-    finally { actx.close && actx.close(); }
-    const SR = 16000;
-    const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(buf.duration * SR)), SR);
-    const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start();
-    const mono = (await off.startRendering()).getChannelData(0);
-    buf = null;
-
-    const CHUNK_SEC = 120, CH = CHUNK_SEC * SR, n = Math.ceil(mono.length / CH);
-    const results = new Array(n); let done = 0;
+    let parts = null;
+    try { parts = await fastAudioParts(file); } catch (e) { console.warn('fast audio:', e); }
+    if (!parts) parts = await slowAudioParts(file);
+    const n = parts.length, results = new Array(n); let done = 0;
     status(n > 1 ? `מתמלל… 0 מתוך ${n} חלקים` : 'מתמלל… בדרך כלל פחות מדקה');
-    await pool(n, 4, async i => {
-      const part = mono.subarray(i * CH, Math.min((i + 1) * CH, mono.length));
-      const b64 = await blobToB64(wavBlob(part, SR));
-      results[i] = (await callGemini(b64)).map(s => ({ start: s.start + i * CHUNK_SEC, end: s.end + i * CHUNK_SEC, text: s.text }));
+    await pool(n, 2, async i => {
+      const b64 = await blobToB64(parts[i].blob);
+      results[i] = (await callGemini(b64, parts[i].mime)).map(s => ({ start: s.start + parts[i].t0, end: s.end + parts[i].t0, text: s.text }));
       done++;
       if (n > 1) status(`מתמלל… ${done} מתוך ${n} חלקים`);
     });
